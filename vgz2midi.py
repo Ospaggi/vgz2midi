@@ -25,6 +25,12 @@ DEFAULT_BPM = 120.0
 MIN_DETECTED_BPM = 40.0
 MAX_DETECTED_BPM = 240.0
 DEFAULT_PPQN = 480
+DEFAULT_PITCH_BEND_RANGE = 2
+DEFAULT_MIDI_VOLUME = 100
+MAX_PITCH_BEND_RANGE = 24
+PITCH_CONTINUITY_WINDOW_SAMPLES = int(SAMPLE_RATE * 0.060)
+PITCH_FINE_STEP_SEMITONES = 0.75
+PITCH_FAST_STEP_SEMITONES = 2.0
 SUPPORTED_EXTENSIONS = {".vgm", ".vgz"}
 
 
@@ -46,13 +52,22 @@ def clean_clock(value: int, default: int) -> int:
     return value or default
 
 
-def frequency_to_midi_note(freq: float) -> Optional[int]:
+def frequency_to_midi_pitch(freq: float) -> Optional[float]:
+    """Convert a frequency to a fractional MIDI note number."""
     if not math.isfinite(freq) or freq <= 0.0:
         return None
-    note = int(round(69.0 + 12.0 * math.log2(freq / 440.0)))
-    if 0 <= note <= 127:
-        return note
+    pitch = 69.0 + 12.0 * math.log2(freq / 440.0)
+    if -12.0 <= pitch <= 139.0:
+        return pitch
     return None
+
+
+def frequency_to_midi_note(freq: float) -> Optional[int]:
+    pitch = frequency_to_midi_pitch(freq)
+    if pitch is None:
+        return None
+    note = int(round(pitch))
+    return note if 0 <= note <= 127 else None
 
 
 def midi_note_frequency(note: float) -> float:
@@ -281,20 +296,43 @@ class MidiTrackState:
     key: str
     name: str
     channel: int
+    port: int
     program: int
     is_drum: bool
     events: List[TimedMidiEvent] = field(default_factory=list)
     active_note: Optional[int] = None
+    active_pitch: Optional[float] = None
     active_since: int = 0
+    pitch_bend: int = 8192
+    controllers: Dict[int, int] = field(default_factory=dict)
+    last_pitch_sample: Optional[int] = None
+    pitch_group_sample: Optional[int] = None
+    pitch_group_serial: int = 0
+    pitch_group_active_note: Optional[int] = None
+    pitch_group_active_pitch: Optional[float] = None
+    pitch_group_active_since: int = 0
+    pitch_group_pitch_bend: int = 8192
+    pitch_group_last_pitch_sample: Optional[int] = None
 
 
 class MidiCollector:
-    def __init__(self, source_name: str, bpm: float = DEFAULT_BPM, ppqn: int = DEFAULT_PPQN):
+    """Collect register-derived musical events and serialize them as SMF type 1."""
+
+    PRIORITY_CONTROL = 0
+    PRIORITY_NOTE_OFF = 1
+    PRIORITY_PITCH = 2
+    PRIORITY_NOTE_ON = 3
+    PRIORITY_RESET = 2
+
+    def __init__(self, source_name: str, bpm: float = DEFAULT_BPM, ppqn: int = DEFAULT_PPQN, pitch_bend_range: int = DEFAULT_PITCH_BEND_RANGE, midi_volume: int = DEFAULT_MIDI_VOLUME):
         self.source_name = source_name
         self.bpm = max(1.0, min(float(bpm), 999.0))
         self.ppqn = int(ppqn)
+        self.pitch_bend_range = max(1, min(MAX_PITCH_BEND_RANGE, int(pitch_bend_range)))
+        self.midi_volume = max(0, min(127, int(midi_volume)))
         self.tempo_description = "manual/default"
         self.tracks: Dict[str, MidiTrackState] = {}
+        self.markers: List[Tuple[int, str]] = []
         self._channel_cursor = 0
         self._serial = 0
         self._melodic_channels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]
@@ -309,18 +347,172 @@ class MidiCollector:
             return track
         if is_drum:
             channel = 9
+            port = 0
         else:
-            channel = self._melodic_channels[self._channel_cursor % len(self._melodic_channels)]
+            logical = self._channel_cursor
+            channel = self._melodic_channels[logical % len(self._melodic_channels)]
+            port = logical // len(self._melodic_channels)
             self._channel_cursor += 1
         track = MidiTrackState(
             key=key,
             name=name,
             channel=channel,
+            port=port,
             program=max(0, min(127, int(program))),
             is_drum=is_drum,
+            controllers={7: self.midi_volume, 10: 64, 11: 127, 1: 0},
         )
         self.tracks[key] = track
         return track
+
+    def add_marker(self, sample: int, text: str) -> None:
+        marker = (max(0, int(sample)), str(text))
+        if marker not in self.markers:
+            self.markers.append(marker)
+
+    def _append_channel_event(self, track: MidiTrackState, sample: int, data: bytes, priority: int) -> None:
+        track.events.append(TimedMidiEvent(max(0, int(sample)), priority, self._next_serial(), data))
+
+    def _control_change(
+        self,
+        key: str,
+        name: str,
+        sample: int,
+        controller: int,
+        value: int,
+        program: int = 80,
+        is_drum: bool = False,
+    ) -> None:
+        controller = max(0, min(127, int(controller)))
+        value = max(0, min(127, int(value)))
+        track = self._get_track(key, name, program, is_drum)
+        if track.controllers.get(controller) == value:
+            return
+        track.controllers[controller] = value
+        status = 0xB0 | track.channel
+        self._append_channel_event(track, sample, bytes([status, controller, value]), self.PRIORITY_CONTROL)
+
+    def set_volume(self, key: str, name: str, sample: int, value: int, program: int = 80, is_drum: bool = False) -> None:
+        # Keep CC7 as a global channel ceiling while preserving chip dynamics.
+        scaled = int(round(max(0, min(127, int(value))) * self.midi_volume / 127.0))
+        self._control_change(key, name, sample, 7, scaled, program, is_drum)
+
+    def set_pan(self, key: str, name: str, sample: int, value: int, program: int = 80, is_drum: bool = False) -> None:
+        self._control_change(key, name, sample, 10, value, program, is_drum)
+
+    def set_expression(self, key: str, name: str, sample: int, value: int, program: int = 80, is_drum: bool = False) -> None:
+        self._control_change(key, name, sample, 11, value, program, is_drum)
+
+    def set_modulation(self, key: str, name: str, sample: int, value: int, program: int = 80, is_drum: bool = False) -> None:
+        self._control_change(key, name, sample, 1, value, program, is_drum)
+
+    def _set_pitch_bend(self, track: MidiTrackState, sample: int, value: int, reset: bool = False) -> None:
+        value = max(0, min(16383, int(value)))
+        if track.pitch_bend == value:
+            return
+        track.pitch_bend = value
+        status = 0xE0 | track.channel
+        data = bytes([status, value & 0x7F, (value >> 7) & 0x7F])
+        self._append_channel_event(track, sample, data, self.PRIORITY_RESET if reset else self.PRIORITY_PITCH)
+
+    def _bend_for_pitch(self, base_note: int, pitch: float) -> int:
+        """Convert a fractional note offset into the asymmetric MIDI 14-bit wheel domain."""
+        semitones = max(-self.pitch_bend_range, min(self.pitch_bend_range, pitch - base_note))
+        normalized = semitones / float(self.pitch_bend_range)
+        if normalized >= 0.0:
+            value = 8192 + int(round(normalized * 8191.0))
+        else:
+            value = 8192 + int(round(normalized * 8192.0))
+        return max(0, min(16383, value))
+
+    @staticmethod
+    def _is_note_or_pitch_event(event: TimedMidiEvent) -> bool:
+        if not event.data:
+            return False
+        return (event.data[0] & 0xF0) in (0x80, 0x90, 0xE0)
+
+    def _prepare_pitch_group(self, track: MidiTrackState, sample: int) -> None:
+        """Coalesce multiple register writes at one VGM timestamp into one final pitch state."""
+        sample = max(0, int(sample))
+        if track.pitch_group_sample != sample:
+            track.pitch_group_sample = sample
+            track.pitch_group_serial = self._serial
+            track.pitch_group_active_note = track.active_note
+            track.pitch_group_active_pitch = track.active_pitch
+            track.pitch_group_active_since = track.active_since
+            track.pitch_group_pitch_bend = track.pitch_bend
+            track.pitch_group_last_pitch_sample = track.last_pitch_sample
+            return
+
+        cutoff = track.pitch_group_serial
+        track.events[:] = [
+            event for event in track.events
+            if not (
+                event.sample == sample
+                and event.serial > cutoff
+                and self._is_note_or_pitch_event(event)
+            )
+        ]
+        track.active_note = track.pitch_group_active_note
+        track.active_pitch = track.pitch_group_active_pitch
+        track.active_since = track.pitch_group_active_since
+        track.pitch_bend = track.pitch_group_pitch_bend
+        track.last_pitch_sample = track.pitch_group_last_pitch_sample
+
+    def _should_use_pitch_bend(self, track: MidiTrackState, sample: int, pitch: float) -> bool:
+        if track.active_note is None or track.active_pitch is None:
+            return False
+        if abs(pitch - track.active_note) >= self.pitch_bend_range - 1e-6:
+            return False
+
+        step = abs(pitch - track.active_pitch)
+        if step <= PITCH_FINE_STEP_SEMITONES:
+            return True
+        if track.last_pitch_sample is None:
+            return False
+        elapsed = max(0, int(sample) - track.last_pitch_sample)
+        return elapsed <= PITCH_CONTINUITY_WINDOW_SAMPLES and step <= PITCH_FAST_STEP_SEMITONES
+
+    def note_on_pitch(
+        self,
+        key: str,
+        name: str,
+        sample: int,
+        pitch: Optional[float],
+        velocity: int = 100,
+        program: int = 80,
+        retrigger: bool = False,
+    ) -> None:
+        """Start/retrigger a note, or retain only genuinely continuous pitch motion as Pitch Bend."""
+        if pitch is None or not math.isfinite(pitch):
+            self.note_off(key, sample)
+            return
+        pitch = max(0.0, min(127.0, float(pitch)))
+        velocity = max(1, min(127, int(velocity)))
+        track = self._get_track(key, name, program, False)
+        self._prepare_pitch_group(track, sample)
+
+        if track.active_note is not None and not retrigger and self._should_use_pitch_bend(track, sample, pitch):
+            bend = self._bend_for_pitch(track.active_note, pitch)
+            # About 0.1 cent at the default +/-2 semitone range; avoids register-noise spam.
+            if abs(bend - track.pitch_bend) >= 4:
+                self._set_pitch_bend(track, sample, bend)
+            track.active_pitch = pitch
+            track.last_pitch_sample = sample
+            return
+
+        if track.active_note is not None:
+            self._append_note_off(track, sample, reset_pitch=False, invalidate_pitch_group=False)
+
+        base_note = max(0, min(127, int(round(pitch))))
+        bend = self._bend_for_pitch(base_note, pitch)
+        self._set_pitch_bend(track, sample, bend)
+        status = 0x90 | track.channel
+        self._append_channel_event(track, sample, bytes([status, base_note, velocity]), self.PRIORITY_NOTE_ON)
+        track.active_note = base_note
+        track.active_pitch = pitch
+        track.active_since = sample
+        track.last_pitch_sample = sample
 
     def note_on(
         self,
@@ -332,34 +524,46 @@ class MidiCollector:
         program: int = 80,
         is_drum: bool = False,
     ) -> None:
+        if not is_drum:
+            self.note_on_pitch(key, name, sample, float(note) if note is not None else None, velocity, program)
+            return
         if note is None:
             self.note_off(key, sample)
             return
         note = max(0, min(127, int(note)))
         velocity = max(1, min(127, int(velocity)))
-        track = self._get_track(key, name, program, is_drum)
+        track = self._get_track(key, name, program, True)
         if track.active_note == note:
             return
         if track.active_note is not None:
             self._append_note_off(track, sample)
         status = 0x90 | track.channel
-        track.events.append(TimedMidiEvent(sample, 1, self._next_serial(), bytes([status, note, velocity])))
+        self._append_channel_event(track, sample, bytes([status, note, velocity]), self.PRIORITY_NOTE_ON)
         track.active_note = note
+        track.active_pitch = float(note)
         track.active_since = sample
 
-    def _append_note_off(self, track: MidiTrackState, sample: int) -> None:
+    def _append_note_off(self, track: MidiTrackState, sample: int, reset_pitch: bool = True, invalidate_pitch_group: bool = True) -> None:
         if track.active_note is None:
             return
         status = 0x80 | track.channel
-        track.events.append(
-            TimedMidiEvent(sample, 1, self._next_serial(), bytes([status, track.active_note, 0]))
-        )
+        self._append_channel_event(track, sample, bytes([status, track.active_note, 0]), self.PRIORITY_NOTE_OFF)
         track.active_note = None
+        track.active_pitch = None
+        track.last_pitch_sample = None
+        if invalidate_pitch_group:
+            track.pitch_group_sample = None
+        if reset_pitch and not track.is_drum and track.pitch_bend != 8192:
+            self._set_pitch_bend(track, sample, 8192, reset=True)
 
     def note_off(self, key: str, sample: int) -> None:
         track = self.tracks.get(key)
         if track is not None:
-            self._append_note_off(track, sample)
+            # Treat all note/pitch writes at one VGM timestamp as one transaction.
+            # Many OPL/OPN drivers write temporary frequency values around Key Off/On
+            # without advancing time; those intermediate values must not become bends.
+            self._prepare_pitch_group(track, sample)
+            self._append_note_off(track, sample, invalidate_pitch_group=False)
 
     def stop_all(self, sample: int) -> None:
         for track in self.tracks.values():
@@ -369,45 +573,72 @@ class MidiCollector:
         ticks_per_second = self.ppqn * self.bpm / 60.0
         return int(round(max(0, sample) * ticks_per_second / SAMPLE_RATE))
 
+    @staticmethod
+    def _cc(channel: int, controller: int, value: int) -> bytes:
+        return bytes([0xB0 | channel, controller & 0x7F, value & 0x7F])
+
     def _make_track_chunk(self, track: MidiTrackState) -> bytes:
         body = bytearray()
         body += encode_vlq(0) + meta_event(0x03, safe_text(track.name))
+        body += encode_vlq(0) + meta_event(0x21, bytes([track.port & 0x7F]))
         if not track.is_drum:
             body += encode_vlq(0) + bytes([0xC0 | track.channel, track.program])
+            for event in (
+                self._cc(track.channel, 101, 0),
+                self._cc(track.channel, 100, 0),
+                self._cc(track.channel, 6, self.pitch_bend_range),
+                self._cc(track.channel, 38, 0),
+                self._cc(track.channel, 101, 127),
+                self._cc(track.channel, 100, 127),
+            ):
+                body += encode_vlq(0) + event
+        for controller, value in ((7, self.midi_volume), (10, 64), (11, 127), (1, 0)):
+            body += encode_vlq(0) + self._cc(track.channel, controller, value)
 
         last_tick = 0
         for event in sorted(track.events):
             tick = self._sample_to_tick(event.sample)
-            delta = max(0, tick - last_tick)
-            body += encode_vlq(delta) + event.data
+            body += encode_vlq(max(0, tick - last_tick)) + event.data
             last_tick = tick
         body += encode_vlq(0) + meta_event(0x2F, b"")
         return b"MTrk" + struct.pack(">I", len(body)) + body
 
+    def _make_conductor_chunk(self, title: str) -> bytes:
+        events: List[Tuple[int, int, bytes]] = []
+        events.append((0, 0, meta_event(0x03, safe_text(title))))
+        events.append((0, 1, meta_event(0x01, safe_text(
+            f"Register-derived MIDI approximation. Tempo: {self.bpm:.1f} BPM ({self.tempo_description}). "
+            f"Pitch Bend (+/-{self.pitch_bend_range} semitones), MIDI CC automation, and VGM loop markers are retained when available.", 240))))
+        tempo_us = max(1, min(0xFFFFFF, int(round(60_000_000 / self.bpm))))
+        events.append((0, 2, bytes([0xFF, 0x51, 0x03]) + tempo_us.to_bytes(3, "big")))
+        events.append((0, 3, bytes([0xFF, 0x58, 0x04, 4, 2, 24, 8])))
+        for index, (sample, text) in enumerate(sorted(self.markers)):
+            events.append((self._sample_to_tick(sample), 10 + index, meta_event(0x06, safe_text(text))))
+
+        conductor = bytearray()
+        last_tick = 0
+        for tick, order, data in sorted(events, key=lambda item: (item[0], item[1])):
+            conductor += encode_vlq(max(0, tick - last_tick)) + data
+            last_tick = tick
+        conductor += encode_vlq(0) + meta_event(0x2F, b"")
+        return b"MTrk" + struct.pack(">I", len(conductor)) + conductor
+
     def write(self, output_path: Path, title: str = "") -> None:
         title = title.strip() or Path(self.source_name).stem
-        conductor = bytearray()
-        conductor += encode_vlq(0) + meta_event(0x03, safe_text(title))
-        conductor += encode_vlq(0) + meta_event(
-            0x01,
-            safe_text(
-                f"Approximate note extraction from VGM/VGZ; original chip timbre and PCM are not preserved. "
-                f"Tempo: {self.bpm:.1f} BPM ({self.tempo_description}).",
-                240,
-            ),
-        )
-        tempo_us = max(1, min(0xFFFFFF, int(round(60_000_000 / self.bpm))))
-        conductor += encode_vlq(0) + bytes([0xFF, 0x51, 0x03]) + tempo_us.to_bytes(3, "big")
-        conductor += encode_vlq(0) + bytes([0xFF, 0x58, 0x04, 4, 2, 24, 8])
-        conductor += encode_vlq(0) + meta_event(0x2F, b"")
-        conductor_chunk = b"MTrk" + struct.pack(">I", len(conductor)) + conductor
-
-        track_chunks = [self._make_track_chunk(track) for track in self.tracks.values() if track.events]
+        conductor_chunk = self._make_conductor_chunk(title)
+        track_chunks = [
+            self._make_track_chunk(track)
+            for track in self.tracks.values()
+            if any(
+                len(event.data) >= 3
+                and (event.data[0] & 0xF0) == 0x90
+                and event.data[2] > 0
+                for event in track.events
+            )
+        ]
         if not track_chunks:
-            # Keep the file valid even when no supported note events were found.
-            empty = MidiTrackState("empty", "No supported note events", 0, 0, False)
+            empty = MidiTrackState("empty", "No supported note events", 0, 0, 0, False)
             track_chunks = [self._make_track_chunk(empty)]
-
         header = b"MThd" + struct.pack(">IHHH", 6, 1, 1 + len(track_chunks), self.ppqn)
         output_path.write_bytes(header + conductor_chunk + b"".join(track_chunks))
 
@@ -420,6 +651,8 @@ class SN76489:
         self.instance = instance
         self.period = [1, 1, 1]
         self.volume = [15, 15, 15, 15]
+        self.pan = [64, 64, 64, 64]
+        self.stereo_enabled = [True, True, True, True]
         self.noise_control = 0
         self.latched_channel = 0
         self.latched_is_volume = False
@@ -427,39 +660,57 @@ class SN76489:
     def _voice_key(self, ch: int) -> str:
         return f"{self.name}#{self.instance}:ch{ch + 1}"
 
+    def _track_name(self, ch: int) -> str:
+        label = "Noise" if ch == 3 else f"Tone {ch + 1}"
+        return f"{self.name} #{self.instance} {label}"
+
+    def _level(self, ch: int) -> int:
+        if not self.stereo_enabled[ch]:
+            return 0
+        return max(0, min(127, int(round((15 - self.volume[ch]) * 127 / 15))))
+
     def _refresh_tone(self, ch: int, sample: int) -> None:
         key = self._voice_key(ch)
+        name = self._track_name(ch)
+        level = self._level(ch)
+        self.collector.set_volume(key, name, sample, level, program=80)
+        self.collector.set_pan(key, name, sample, self.pan[ch], program=80)
         period = self.period[ch] or 0x400
-        if self.volume[ch] >= 15 or period <= 0:
+        if level <= 0 or period <= 0:
             self.collector.note_off(key, sample)
             return
         freq = self.clock / (32.0 * period)
-        velocity = max(12, 127 - self.volume[ch] * 8)
-        self.collector.note_on(
-            key,
-            f"{self.name} #{self.instance} Tone {ch + 1}",
-            sample,
-            frequency_to_midi_note(freq),
-            velocity,
-            program=80,
-        )
+        self.collector.note_on_pitch(key, name, sample, frequency_to_midi_pitch(freq), max(12, level), program=80)
 
     def _refresh_noise(self, sample: int) -> None:
-        key = self._voice_key(3)
-        if self.volume[3] >= 15:
+        ch = 3
+        key = self._voice_key(ch)
+        name = self._track_name(ch)
+        level = self._level(ch)
+        self.collector.set_volume(key, name, sample, level, is_drum=True)
+        self.collector.set_pan(key, name, sample, self.pan[ch], is_drum=True)
+        if level <= 0:
             self.collector.note_off(key, sample)
             return
         rate = self.noise_control & 0x03
         drum_note = [42, 46, 38, 36][rate]
-        velocity = max(16, 127 - self.volume[3] * 8)
-        self.collector.note_on(
-            key,
-            f"{self.name} #{self.instance} Noise",
-            sample,
-            drum_note,
-            velocity,
-            is_drum=True,
-        )
+        self.collector.note_on(key, name, sample, drum_note, max(16, level), is_drum=True)
+
+    def set_stereo(self, value: int, sample: int) -> None:
+        """Apply Game Gear stereo routing (bits 7-4 left, 3-0 right)."""
+        value &= 0xFF
+        for ch in range(4):
+            left = bool(value & (1 << (ch + 4)))
+            right = bool(value & (1 << ch))
+            pan = 64 if left == right else (0 if left else 127)
+            enabled = left or right
+            if self.pan[ch] != pan or self.stereo_enabled[ch] != enabled:
+                self.pan[ch] = pan
+                self.stereo_enabled[ch] = enabled
+                if ch < 3:
+                    self._refresh_tone(ch, sample)
+                else:
+                    self._refresh_noise(sample)
 
     def write(self, value: int, sample: int) -> None:
         value &= 0xFF
@@ -505,36 +756,25 @@ class AY8910:
         mixer = self.reg[7]
         vol_reg = self.reg[8 + ch]
         volume = 15 if (vol_reg & 0x10) else (vol_reg & 0x0F)
-        velocity = max(12, min(127, volume * 8))
-
+        level = max(0, min(127, int(round(volume * 127 / 15))))
+        velocity = max(12, level)
         tone_enabled = not bool(mixer & (1 << ch))
         noise_enabled = not bool(mixer & (1 << (ch + 3)))
 
         tone_key = self._tone_key(ch)
-        if tone_enabled and volume > 0 and period > 0:
+        tone_name = f"{self.name} #{self.instance} Tone {ch + 1}"
+        self.collector.set_volume(tone_key, tone_name, sample, level, program=80)
+        if tone_enabled and level > 0 and period > 0:
             freq = self.clock / (16.0 * period)
-            self.collector.note_on(
-                tone_key,
-                f"{self.name} #{self.instance} Tone {ch + 1}",
-                sample,
-                frequency_to_midi_note(freq),
-                velocity,
-                program=80,
-            )
+            self.collector.note_on_pitch(tone_key, tone_name, sample, frequency_to_midi_pitch(freq), velocity, program=80)
         else:
             self.collector.note_off(tone_key, sample)
 
         noise_key = self._noise_key(ch)
-        if noise_enabled and volume > 0:
-            drum_note = [42, 38, 46][ch]
-            self.collector.note_on(
-                noise_key,
-                f"{self.name} #{self.instance} Noise {ch + 1}",
-                sample,
-                drum_note,
-                velocity,
-                is_drum=True,
-            )
+        noise_name = f"{self.name} #{self.instance} Noise {ch + 1}"
+        self.collector.set_volume(noise_key, noise_name, sample, level, is_drum=True)
+        if noise_enabled and level > 0:
+            self.collector.note_on(noise_key, noise_name, sample, [42, 38, 46][ch], velocity, is_drum=True)
         else:
             self.collector.note_off(noise_key, sample)
 
@@ -559,15 +799,10 @@ class AY8910:
 
 
 class OPLChip:
-    def __init__(
-        self,
-        collector: MidiCollector,
-        name: str,
-        clock: int,
-        channels: int,
-        instance: int = 1,
-        opl3: bool = False,
-    ):
+    MOD_OFFSETS = [0, 1, 2, 8, 9, 10, 16, 17, 18]
+    CAR_OFFSETS = [3, 4, 5, 11, 12, 13, 19, 20, 21]
+
+    def __init__(self, collector: MidiCollector, name: str, clock: int, channels: int, instance: int = 1, opl3: bool = False):
         self.collector = collector
         self.name = name
         self.clock = clock
@@ -576,55 +811,86 @@ class OPLChip:
         self.opl3 = opl3
         self.a0 = [0] * channels
         self.b0 = [0] * channels
+        self.c0 = [0] * channels
+        self.tl_mod = [0] * channels
+        self.tl_car = [0] * channels
+        self.vib_mod = [False] * channels
+        self.vib_car = [False] * channels
         self.rhythm = 0
 
     def _key(self, ch: int) -> str:
         return f"{self.name}#{self.instance}:ch{ch}"
 
-    def _refresh(self, ch: int, sample: int) -> None:
+    def _track_name(self, ch: int) -> str:
+        return f"{self.name} #{self.instance} Channel {ch + 1}"
+
+    def _operator_channel(self, port: int, register: int, base_register: int) -> Tuple[Optional[int], Optional[bool]]:
+        offset = register - base_register
+        if offset in self.MOD_OFFSETS:
+            return port * 9 + self.MOD_OFFSETS.index(offset), False
+        if offset in self.CAR_OFFSETS:
+            return port * 9 + self.CAR_OFFSETS.index(offset), True
+        return None, None
+
+    def _expression(self, ch: int) -> int:
+        additive = bool(self.c0[ch] & 0x01)
+        tl = min(self.tl_mod[ch], self.tl_car[ch]) if additive else self.tl_car[ch]
+        return max(0, min(127, int(round((63 - tl) * 127 / 63))))
+
+    def _pan(self, ch: int) -> int:
+        if not self.opl3:
+            return 64
+        left = bool(self.c0[ch] & 0x10)
+        right = bool(self.c0[ch] & 0x20)
+        if left and not right:
+            return 0
+        if right and not left:
+            return 127
+        return 64
+
+    def _modulation(self, ch: int) -> int:
+        additive = bool(self.c0[ch] & 0x01)
+        return 96 if (self.vib_car[ch] or (additive and self.vib_mod[ch])) else 0
+
+    def _refresh_controls(self, ch: int, sample: int) -> None:
         if ch >= self.channels:
             return
         key = self._key(ch)
-        rhythm_mode = bool(self.rhythm & 0x20)
-        if rhythm_mode and 6 <= ch <= 8:
+        name = self._track_name(ch)
+        self.collector.set_expression(key, name, sample, self._expression(ch), program=16)
+        self.collector.set_pan(key, name, sample, self._pan(ch), program=16)
+        self.collector.set_modulation(key, name, sample, self._modulation(ch), program=16)
+
+    def _refresh(self, ch: int, sample: int, retrigger: bool = False) -> None:
+        if ch >= self.channels:
+            return
+        key = self._key(ch)
+        name = self._track_name(ch)
+        self._refresh_controls(ch, sample)
+        if bool(self.rhythm & 0x20) and 6 <= ch <= 8:
             self.collector.note_off(key, sample)
             return
         fnum = self.a0[ch] | ((self.b0[ch] & 0x03) << 8)
         block = (self.b0[ch] >> 2) & 0x07
-        key_on = bool(self.b0[ch] & 0x20)
-        if not key_on or fnum == 0:
+        if not (self.b0[ch] & 0x20) or fnum == 0:
             self.collector.note_off(key, sample)
             return
         divisor = 288.0 if self.opl3 else 72.0
         freq = fnum * (2.0 ** (block - 1)) * self.clock / ((2.0 ** 19) * divisor)
-        self.collector.note_on(
-            key,
-            f"{self.name} #{self.instance} Channel {ch + 1}",
-            sample,
-            frequency_to_midi_note(freq),
-            100,
-            program=16,
-        )
+        self.collector.note_on_pitch(key, name, sample, frequency_to_midi_pitch(freq), max(24, self._expression(ch)), program=16, retrigger=retrigger)
 
     def _refresh_rhythm(self, old: int, new: int, sample: int) -> None:
         rhythm_on = bool(new & 0x20)
         if rhythm_on != bool(old & 0x20):
             for ch in range(6, min(9, self.channels)):
                 self._refresh(ch, sample)
-        mapping = [(4, 36, "Bass Drum"), (3, 38, "Snare"), (2, 45, "Tom"), (1, 49, "Cymbal"), (0, 42, "Hi-Hat")]
-        for bit, note, label in mapping:
+        for bit, note, label in [(4, 36, "Bass Drum"), (3, 38, "Snare"), (2, 45, "Tom"), (1, 49, "Cymbal"), (0, 42, "Hi-Hat")]:
             key = f"{self.name}#{self.instance}:rhythm{bit}"
+            name = f"{self.name} #{self.instance} {label}"
             is_on = rhythm_on and bool(new & (1 << bit))
             was_on = bool(old & 0x20) and bool(old & (1 << bit))
             if is_on and not was_on:
-                self.collector.note_on(
-                    key,
-                    f"{self.name} #{self.instance} {label}",
-                    sample,
-                    note,
-                    110,
-                    is_drum=True,
-                )
+                self.collector.note_on(key, name, sample, note, 110, is_drum=True)
             elif was_on and not is_on:
                 self.collector.note_off(key, sample)
 
@@ -633,16 +899,39 @@ class OPLChip:
         register &= 0xFF
         value &= 0xFF
         base = 9 if (self.opl3 and port == 1) else 0
-        if 0xA0 <= register <= 0xA8:
-            ch = base + (register - 0xA0)
+        if 0x20 <= register <= 0x35:
+            ch, carrier = self._operator_channel(port if self.opl3 else 0, register, 0x20)
+            if ch is not None and ch < self.channels:
+                if carrier:
+                    self.vib_car[ch] = bool(value & 0x40)
+                else:
+                    self.vib_mod[ch] = bool(value & 0x40)
+                self._refresh_controls(ch, sample)
+        elif 0x40 <= register <= 0x55:
+            ch, carrier = self._operator_channel(port if self.opl3 else 0, register, 0x40)
+            if ch is not None and ch < self.channels:
+                if carrier:
+                    self.tl_car[ch] = value & 0x3F
+                else:
+                    self.tl_mod[ch] = value & 0x3F
+                self._refresh_controls(ch, sample)
+        elif 0xA0 <= register <= 0xA8:
+            ch = base + register - 0xA0
             if ch < self.channels:
                 self.a0[ch] = value
                 self._refresh(ch, sample)
         elif 0xB0 <= register <= 0xB8:
-            ch = base + (register - 0xB0)
+            ch = base + register - 0xB0
             if ch < self.channels:
+                old = self.b0[ch]
                 self.b0[ch] = value
-                self._refresh(ch, sample)
+                retrigger = not bool(old & 0x20) and bool(value & 0x20)
+                self._refresh(ch, sample, retrigger=retrigger)
+        elif 0xC0 <= register <= 0xC8:
+            ch = base + register - 0xC0
+            if ch < self.channels:
+                self.c0[ch] = value
+                self._refresh_controls(ch, sample)
         elif register == 0xBD and port == 0:
             old = self.rhythm
             self.rhythm = value
@@ -658,66 +947,69 @@ class OPLLChip:
         self.low = [0] * 9
         self.high = [0] * 9
         self.instvol = [0] * 9
+        self.custom_carrier_vibrato = False
         self.rhythm = 0
 
     def _key(self, ch: int) -> str:
         return f"{self.name}#{self.instance}:ch{ch}"
 
-    def _refresh(self, ch: int, sample: int) -> None:
+    def _track_name(self, ch: int) -> str:
+        return f"{self.name} #{self.instance} Channel {ch + 1}"
+
+    def _level(self, ch: int) -> int:
+        return max(0, min(127, int(round((15 - (self.instvol[ch] & 0x0F)) * 127 / 15))))
+
+    def _refresh(self, ch: int, sample: int, retrigger: bool = False) -> None:
         key = self._key(ch)
+        name = self._track_name(ch)
+        level = self._level(ch)
+        self.collector.set_volume(key, name, sample, level, program=16)
+        instrument = (self.instvol[ch] >> 4) & 0x0F
+        modulation = 96 if instrument == 0 and self.custom_carrier_vibrato else 0
+        self.collector.set_modulation(key, name, sample, modulation, program=16)
         if (self.rhythm & 0x20) and ch >= 6:
             self.collector.note_off(key, sample)
             return
         fnum = self.low[ch] | ((self.high[ch] & 1) << 8)
         block = (self.high[ch] >> 1) & 7
-        key_on = bool(self.high[ch] & 0x10)
-        if not key_on or fnum == 0:
+        if not (self.high[ch] & 0x10) or fnum == 0 or level <= 0:
             self.collector.note_off(key, sample)
             return
         freq = fnum * (2.0 ** block) * self.clock / (72.0 * (2.0 ** 19))
-        volume = self.instvol[ch] & 0x0F
-        velocity = max(18, 127 - volume * 7)
-        self.collector.note_on(
-            key,
-            f"{self.name} #{self.instance} Channel {ch + 1}",
-            sample,
-            frequency_to_midi_note(freq),
-            velocity,
-            program=16,
-        )
+        self.collector.note_on_pitch(key, name, sample, frequency_to_midi_pitch(freq), max(18, level), program=16, retrigger=retrigger)
 
     def _rhythm_update(self, old: int, new: int, sample: int) -> None:
         if bool(old & 0x20) != bool(new & 0x20):
             for ch in range(6, 9):
                 self._refresh(ch, sample)
-        mapping = [(4, 36, "Bass Drum"), (3, 38, "Snare"), (2, 45, "Tom"), (1, 49, "Cymbal"), (0, 42, "Hi-Hat")]
-        for bit, note, label in mapping:
+        for bit, note, label in [(4, 36, "Bass Drum"), (3, 38, "Snare"), (2, 45, "Tom"), (1, 49, "Cymbal"), (0, 42, "Hi-Hat")]:
             key = f"{self.name}#{self.instance}:rhythm{bit}"
+            name = f"{self.name} #{self.instance} {label}"
             is_on = bool(new & 0x20) and bool(new & (1 << bit))
             was_on = bool(old & 0x20) and bool(old & (1 << bit))
             if is_on and not was_on:
-                self.collector.note_on(
-                    key,
-                    f"{self.name} #{self.instance} {label}",
-                    sample,
-                    note,
-                    110,
-                    is_drum=True,
-                )
+                self.collector.note_on(key, name, sample, note, 110, is_drum=True)
             elif was_on and not is_on:
                 self.collector.note_off(key, sample)
 
     def write(self, register: int, value: int, sample: int) -> None:
         register &= 0xFF
         value &= 0xFF
-        if 0x10 <= register <= 0x18:
+        if register == 0x01:
+            self.custom_carrier_vibrato = bool(value & 0x40)
+            for ch in range(9):
+                if self._key(ch) in self.collector.tracks and ((self.instvol[ch] >> 4) & 0x0F) == 0:
+                    self._refresh(ch, sample)
+        elif 0x10 <= register <= 0x18:
             ch = register - 0x10
             self.low[ch] = value
             self._refresh(ch, sample)
         elif 0x20 <= register <= 0x28:
             ch = register - 0x20
+            old = self.high[ch]
             self.high[ch] = value
-            self._refresh(ch, sample)
+            retrigger = not bool(old & 0x10) and bool(value & 0x10)
+            self._refresh(ch, sample, retrigger=retrigger)
         elif 0x30 <= register <= 0x38:
             ch = register - 0x30
             self.instvol[ch] = value
@@ -729,50 +1021,87 @@ class OPLLChip:
 
 
 class OPNChip:
-    def __init__(
-        self,
-        collector: MidiCollector,
-        name: str,
-        clock: int,
-        channels: int,
-        instance: int = 1,
-        has_ssg: bool = False,
-    ):
+    # OPN register groups are ordered OP1, OP3, OP2, OP4.
+    CARRIER_GROUPS = {
+        0: (3,), 1: (3,), 2: (3,), 3: (3,),
+        4: (2, 3), 5: (2, 1, 3), 6: (2, 1, 3), 7: (0, 2, 1, 3),
+    }
+
+    def __init__(self, collector: MidiCollector, name: str, clock: int, channels: int,
+                 instance: int = 1, has_ssg: bool = False, has_stereo: bool = True):
         self.collector = collector
         self.name = name
         self.clock = clock
         self.channels = channels
         self.instance = instance
+        self.has_stereo = has_stereo
         self.low = [0] * channels
         self.high = [0] * channels
         self.key_on = [False] * channels
+        self.algorithm = [0] * channels
+        self.tl = [[127] * 4 for _ in range(channels)]
+        self.pan_fms = [0xC0 if has_stereo else 0] * channels
+        self.lfo_enabled = False
         self.dac_enabled = False
         self.ssg = AY8910(collector, f"{name} SSG", max(1, clock // 4), instance) if has_ssg else None
 
     def _key(self, ch: int) -> str:
         return f"{self.name}#{self.instance}:ch{ch}"
 
-    def _refresh(self, ch: int, sample: int) -> None:
-        key = self._key(ch)
+    def _track_name(self, ch: int) -> str:
+        return f"{self.name} #{self.instance} Channel {ch + 1}"
+
+    def _expression(self, ch: int) -> int:
+        groups = self.CARRIER_GROUPS.get(self.algorithm[ch] & 7, (3,))
+        level = max(0, min(127, 127 - min(self.tl[ch][group] for group in groups)))
+        if self.has_stereo and not (self.pan_fms[ch] & 0xC0):
+            return 0
+        return level
+
+    def _pan(self, ch: int) -> int:
+        if not self.has_stereo:
+            return 64
+        left = bool(self.pan_fms[ch] & 0x80)
+        right = bool(self.pan_fms[ch] & 0x40)
+        if left and not right:
+            return 0
+        if right and not left:
+            return 127
+        return 64
+
+    def _modulation(self, ch: int) -> int:
+        if not self.lfo_enabled:
+            return 0
+        fms = self.pan_fms[ch] & 0x07
+        ams = (self.pan_fms[ch] >> 4) & 0x03
+        return max(0, min(127, max(fms * 18, ams * 32)))
+
+    def _refresh_controls(self, ch: int, sample: int) -> None:
         if ch >= self.channels:
             return
+        key = self._key(ch)
+        name = self._track_name(ch)
+        self.collector.set_expression(key, name, sample, self._expression(ch), program=81)
+        self.collector.set_pan(key, name, sample, self._pan(ch), program=81)
+        self.collector.set_modulation(key, name, sample, self._modulation(ch), program=81)
+
+    def _refresh(self, ch: int, sample: int, retrigger: bool = False) -> None:
+        if ch >= self.channels:
+            return
+        key = self._key(ch)
+        name = self._track_name(ch)
+        self._refresh_controls(ch, sample)
         if self.dac_enabled and ch == 5 and self.channels >= 6:
             self.collector.note_off(key, sample)
             return
         fnum = self.low[ch] | ((self.high[ch] & 0x07) << 8)
         block = (self.high[ch] >> 3) & 0x07
-        if not self.key_on[ch] or fnum == 0:
+        if not self.key_on[ch] or fnum == 0 or self._expression(ch) <= 0:
             self.collector.note_off(key, sample)
             return
-        freq = fnum * (2.0 ** block) * self.clock / (144.0 * (2.0 ** 20))
-        self.collector.note_on(
-            key,
-            f"{self.name} #{self.instance} Channel {ch + 1}",
-            sample,
-            frequency_to_midi_note(freq),
-            100,
-            program=81,
-        )
+        freq = fnum * (2.0 ** (block - 1)) * self.clock / (144.0 * (2.0 ** 20))
+        self.collector.note_on_pitch(key, name, sample, frequency_to_midi_pitch(freq),
+                                     max(24, self._expression(ch)), program=81, retrigger=retrigger)
 
     def write(self, port: int, register: int, value: int, sample: int) -> None:
         port &= 1
@@ -780,23 +1109,44 @@ class OPNChip:
         value &= 0xFF
         if self.ssg is not None and port == 0 and register <= 0x0D:
             self.ssg.write(register, value, sample)
-        if 0xA0 <= register <= 0xA2:
-            ch = port * 3 + (register - 0xA0)
+        if register == 0x22 and port == 0:
+            self.lfo_enabled = bool(value & 0x08)
+            for ch in range(self.channels):
+                self._refresh_controls(ch, sample)
+        elif 0x40 <= register <= 0x4F and (register & 0x03) != 0x03:
+            ch = port * 3 + (register & 0x03)
+            group = (register >> 2) & 0x03
+            if ch < self.channels:
+                self.tl[ch][group] = value & 0x7F
+                self._refresh_controls(ch, sample)
+        elif 0xA0 <= register <= 0xA2:
+            ch = port * 3 + register - 0xA0
             if ch < self.channels:
                 self.low[ch] = value
                 self._refresh(ch, sample)
         elif 0xA4 <= register <= 0xA6:
-            ch = port * 3 + (register - 0xA4)
+            ch = port * 3 + register - 0xA4
             if ch < self.channels:
                 self.high[ch] = value
                 self._refresh(ch, sample)
+        elif 0xB0 <= register <= 0xB2:
+            ch = port * 3 + register - 0xB0
+            if ch < self.channels:
+                self.algorithm[ch] = value & 0x07
+                self._refresh_controls(ch, sample)
+        elif 0xB4 <= register <= 0xB6:
+            ch = port * 3 + register - 0xB4
+            if ch < self.channels:
+                self.pan_fms[ch] = value
+                self._refresh_controls(ch, sample)
         elif register == 0x28 and port == 0:
             code = value & 0x07
             if code not in (3, 7):
                 ch = (code & 0x03) + (3 if code & 0x04 else 0)
                 if ch < self.channels:
-                    self.key_on[ch] = bool(value & 0xF0)
-                    self._refresh(ch, sample)
+                    new_on = bool(value & 0xF0)
+                    self.key_on[ch] = new_on
+                    self._refresh(ch, sample, retrigger=new_on)
         elif register == 0x2B and port == 0 and self.channels >= 6:
             old = self.dac_enabled
             self.dac_enabled = bool(value & 0x80)
@@ -805,19 +1155,11 @@ class OPNChip:
 
 
 class YM2151:
-    NOTE_CODE_TO_SEMITONE = {
-        0x0: 0,
-        0x1: 1,
-        0x2: 2,
-        0x4: 3,
-        0x5: 4,
-        0x6: 5,
-        0x8: 6,
-        0x9: 7,
-        0xA: 8,
-        0xC: 9,
-        0xD: 10,
-        0xE: 11,
+    NOTE_CODE_TO_SEMITONE = {0x0: 0, 0x1: 1, 0x2: 2, 0x4: 3, 0x5: 4, 0x6: 5,
+                             0x8: 6, 0x9: 7, 0xA: 8, 0xC: 9, 0xD: 10, 0xE: 11}
+    CARRIER_GROUPS = {
+        0: (3,), 1: (3,), 2: (3,), 3: (3,),
+        4: (1, 3), 5: (1, 2, 3), 6: (1, 2, 3), 7: (0, 1, 2, 3),
     }
 
     def __init__(self, collector: MidiCollector, name: str, instance: int = 1):
@@ -827,13 +1169,50 @@ class YM2151:
         self.kc = [0] * 8
         self.kf = [0] * 8
         self.key_on = [False] * 8
+        self.algorithm_pan = [0xC0] * 8
+        self.tl = [[127] * 4 for _ in range(8)]
+        self.pms_ams = [0] * 8
+        self.pmd = 0
+        self.lfo_frequency = 0
 
     def _key(self, ch: int) -> str:
         return f"{self.name}#{self.instance}:ch{ch}"
 
-    def _refresh(self, ch: int, sample: int) -> None:
+    def _track_name(self, ch: int) -> str:
+        return f"{self.name} #{self.instance} Channel {ch + 1}"
+
+    def _expression(self, ch: int) -> int:
+        carriers = self.CARRIER_GROUPS.get(self.algorithm_pan[ch] & 7, (3,))
+        level = max(0, min(127, 127 - min(self.tl[ch][group] for group in carriers)))
+        return 0 if not (self.algorithm_pan[ch] & 0xC0) else level
+
+    def _pan(self, ch: int) -> int:
+        left = bool(self.algorithm_pan[ch] & 0x40)
+        right = bool(self.algorithm_pan[ch] & 0x80)
+        if left and not right:
+            return 0
+        if right and not left:
+            return 127
+        return 64
+
+    def _modulation(self, ch: int) -> int:
+        pms = (self.pms_ams[ch] >> 4) & 0x07
+        if pms == 0 or self.pmd == 0:
+            return 0
+        return max(0, min(127, int(round((pms / 7.0) * (self.pmd / 127.0) * 127))))
+
+    def _refresh_controls(self, ch: int, sample: int) -> None:
         key = self._key(ch)
-        if not self.key_on[ch]:
+        name = self._track_name(ch)
+        self.collector.set_expression(key, name, sample, self._expression(ch), program=81)
+        self.collector.set_pan(key, name, sample, self._pan(ch), program=81)
+        self.collector.set_modulation(key, name, sample, self._modulation(ch), program=81)
+
+    def _refresh(self, ch: int, sample: int, retrigger: bool = False) -> None:
+        key = self._key(ch)
+        name = self._track_name(ch)
+        self._refresh_controls(ch, sample)
+        if not self.key_on[ch] or self._expression(ch) <= 0:
             self.collector.note_off(key, sample)
             return
         code = self.kc[ch]
@@ -842,24 +1221,28 @@ class YM2151:
         if semitone is None:
             self.collector.note_off(key, sample)
             return
-        fraction = ((self.kf[ch] >> 2) & 0x3F) / 64.0
-        note = int(round(12 * (octave + 1) + semitone + fraction))
-        self.collector.note_on(
-            key,
-            f"{self.name} #{self.instance} Channel {ch + 1}",
-            sample,
-            note,
-            100,
-            program=81,
-        )
+        pitch = 12.0 * (octave + 1) + semitone + (((self.kf[ch] >> 2) & 0x3F) / 64.0)
+        self.collector.note_on_pitch(key, name, sample, pitch, max(24, self._expression(ch)), program=81, retrigger=retrigger)
 
     def write(self, register: int, value: int, sample: int) -> None:
         register &= 0xFF
         value &= 0xFF
         if register == 0x08:
             ch = value & 0x07
-            self.key_on[ch] = bool(value & 0x78)
-            self._refresh(ch, sample)
+            new_on = bool(value & 0x78)
+            self.key_on[ch] = new_on
+            self._refresh(ch, sample, retrigger=new_on)
+        elif register == 0x18:
+            self.lfo_frequency = value
+        elif register == 0x19:
+            if value & 0x80:
+                self.pmd = value & 0x7F
+                for ch in range(8):
+                    self._refresh_controls(ch, sample)
+        elif 0x20 <= register <= 0x27:
+            ch = register - 0x20
+            self.algorithm_pan[ch] = value
+            self._refresh_controls(ch, sample)
         elif 0x28 <= register <= 0x2F:
             ch = register - 0x28
             self.kc[ch] = value
@@ -868,6 +1251,16 @@ class YM2151:
             ch = register - 0x30
             self.kf[ch] = value
             self._refresh(ch, sample)
+        elif 0x38 <= register <= 0x3F:
+            ch = register - 0x38
+            self.pms_ams[ch] = value
+            self._refresh_controls(ch, sample)
+        elif 0x60 <= register <= 0x7F:
+            ch = register & 0x07
+            group = (register - 0x60) // 8
+            if group < 4:
+                self.tl[ch][group] = value & 0x7F
+                self._refresh_controls(ch, sample)
 
 
 @dataclass
@@ -881,26 +1274,34 @@ class ConversionResult:
     bpm: float
     bpm_confidence: float
     bpm_method: str
+    loop_start_seconds: Optional[float] = None
+    loop_end_seconds: Optional[float] = None
     warning: str = ""
 
 
 class VGMConverter:
-    def __init__(self, source: Path, bpm: Optional[float] = None):
+    def __init__(self, source: Path, bpm: Optional[float] = None, pitch_bend_range: int = DEFAULT_PITCH_BEND_RANGE, midi_volume: int = DEFAULT_MIDI_VOLUME):
         self.source = Path(source)
         self.requested_bpm = bpm
         self.data = self._read_file(self.source)
         if len(self.data) < 0x40 or self.data[:4] != b"Vgm ":
-            raise ValueError("Invalid VGM/VGZ file: the VGM header was not found.")
+            raise ValueError("Invalid VGM/VGZ file: VGM header not found.")
         self.version = u32le(self.data, 0x08)
         data_rel = u32le(self.data, 0x34) if self.version >= 0x00000150 else 0
         self.data_offset = 0x34 + data_rel if data_rel else 0x40
         if self.data_offset < 0x40 or self.data_offset >= len(self.data):
             raise ValueError(f"Invalid VGM data offset: 0x{self.data_offset:X}")
-        self.collector = MidiCollector(self.source.name, bpm if bpm is not None else DEFAULT_BPM)
+        self.collector = MidiCollector(self.source.name, bpm if bpm is not None else DEFAULT_BPM, pitch_bend_range=pitch_bend_range, midi_volume=midi_volume)
         self.used_chips: Set[str] = set()
         self.unsupported_commands = 0
         self.sample_pos = 0
         self.loop_samples = u32le(self.data, 0x20)
+        loop_rel = u32le(self.data, 0x1C)
+        self.loop_offset = 0x1C + loop_rel if loop_rel else None
+        if self.loop_offset is not None and not (self.data_offset <= self.loop_offset < len(self.data)):
+            self.loop_offset = None
+        self.loop_start_sample: Optional[int] = None
+        self.loop_end_sample: Optional[int] = None
         self.bpm_detection = BPMDetection(
             bpm if bpm is not None else DEFAULT_BPM,
             1.0 if bpm is not None else 0.0,
@@ -918,7 +1319,7 @@ class VGMConverter:
             try:
                 return gzip.decompress(raw)
             except OSError as exc:
-                raise ValueError(f"Unable to decompress the VGZ file: {exc}") from exc
+                raise ValueError(f"Unable to decompress VGZ data: {exc}") from exc
         return raw
 
     def _read_gd3_title(self) -> str:
@@ -956,8 +1357,8 @@ class VGMConverter:
         ]
         self.ym2151 = [YM2151(c, "YM2151", 1), YM2151(c, "YM2151", 2)]
         self.ym2203 = [
-            OPNChip(c, "YM2203", self._clock(0x44, 3_000_000), 3, 1, True),
-            OPNChip(c, "YM2203", self._clock(0x44, 3_000_000), 3, 2, True),
+            OPNChip(c, "YM2203", self._clock(0x44, 3_000_000), 3, 1, True, False),
+            OPNChip(c, "YM2203", self._clock(0x44, 3_000_000), 3, 2, True, False),
         ]
         self.ym2608 = [
             OPNChip(c, "YM2608", self._clock(0x48, 8_000_000), 6, 1, True),
@@ -990,7 +1391,7 @@ class VGMConverter:
 
     def _require(self, size: int, pos: int) -> None:
         if pos + size > len(self.data):
-            raise ValueError(f"The VGM command stream is truncated at file offset 0x{pos:X}.")
+            raise ValueError(f"VGM command stream is truncated at 0x{pos:X}.")
 
     def _chip_write(self, cmd: int, reg: int, value: int, instance: int = 0) -> None:
         s = self.sample_pos
@@ -1029,6 +1430,8 @@ class VGMConverter:
         p = self.data_offset
         data = self.data
         while p < len(data):
+            if self.loop_offset is not None and p == self.loop_offset and self.loop_start_sample is None:
+                self.loop_start_sample = self.sample_pos
             cmd = data[p]
             if cmd == 0x00:
                 p += 1
@@ -1042,6 +1445,9 @@ class VGMConverter:
             elif cmd == 0x40:
                 p += 3
             elif cmd == 0x4F:
+                self._require(2, p)
+                self.used_chips.add("SN76489")
+                self.sn[0].set_stereo(data[p + 1], self.sample_pos)
                 p += 2
             elif cmd == 0x50:
                 self._require(2, p)
@@ -1068,7 +1474,7 @@ class VGMConverter:
             elif cmd == 0x67:
                 self._require(7, p)
                 if data[p + 1] != 0x66:
-                    raise ValueError(f"Invalid VGM data block at file offset 0x{p:X}.")
+                    raise ValueError(f"Invalid VGM data block at 0x{p:X}.")
                 size = u32le(data, p + 3)
                 self._require(7 + size, p)
                 p += 7 + size
@@ -1127,6 +1533,13 @@ class VGMConverter:
             if p > len(data):
                 raise ValueError("A VGM command extends beyond the end of the file.")
 
+        if self.loop_samples > 0:
+            if self.loop_start_sample is None:
+                self.loop_start_sample = max(0, self.sample_pos - self.loop_samples)
+            computed_end = self.loop_start_sample + self.loop_samples
+            self.loop_end_sample = min(self.sample_pos, computed_end) if self.sample_pos else computed_end
+            self.collector.add_marker(self.loop_start_sample, "LOOP START")
+            self.collector.add_marker(self.loop_end_sample, "LOOP END")
         self.collector.stop_all(self.sample_pos)
 
     def convert(self, output_path: Path) -> ConversionResult:
@@ -1144,10 +1557,14 @@ class VGMConverter:
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         self.collector.write(output_path, self.title)
-        note_tracks = sum(1 for track in self.collector.tracks.values() if track.events)
+        note_tracks = sum(
+            1 for track in self.collector.tracks.values()
+            if any(len(event.data) >= 3 and (event.data[0] & 0xF0) == 0x90 and event.data[2] > 0
+                   for event in track.events)
+        )
         warning = ""
         if not note_tracks:
-            warning = "No supported note events were found. The file may primarily use PCM or an unsupported sound chip."
+            warning = "No supported note events were found; the file may mainly use PCM or unsupported chips."
         return ConversionResult(
             source=self.source,
             output=output_path,
@@ -1158,6 +1575,8 @@ class VGMConverter:
             bpm=self.bpm_detection.bpm,
             bpm_confidence=self.bpm_detection.confidence,
             bpm_method=self.bpm_detection.method,
+            loop_start_seconds=(self.loop_start_sample / SAMPLE_RATE) if self.loop_start_sample is not None else None,
+            loop_end_seconds=(self.loop_end_sample / SAMPLE_RATE) if self.loop_end_sample is not None else None,
             warning=warning,
         )
 
@@ -1167,11 +1586,11 @@ def output_path_for(source: Path, output_dir: Optional[Path]) -> Path:
     return directory / f"{source.stem}.mid"
 
 
-def convert_file(source: Path, output_dir: Optional[Path] = None, bpm: Optional[float] = None) -> ConversionResult:
+def convert_file(source: Path, output_dir: Optional[Path] = None, bpm: Optional[float] = None, pitch_bend_range: int = DEFAULT_PITCH_BEND_RANGE, midi_volume: int = DEFAULT_MIDI_VOLUME) -> ConversionResult:
     source = Path(source)
     if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Unsupported file extension: {source.suffix}")
-    converter = VGMConverter(source, bpm)
+    converter = VGMConverter(source, bpm, pitch_bend_range, midi_volume)
     return converter.convert(output_path_for(source, output_dir))
 
 
@@ -1200,11 +1619,13 @@ def gather_input_files(paths: Iterable[Path]) -> List[Path]:
 def format_result(result: ConversionResult) -> str:
     chips = ", ".join(result.used_chips) if result.used_chips else "none"
     text = (
-        f"Converted: {result.source.name} -> {result.output.name if result.output else '-'} | "
-        f"{result.duration_seconds:.2f} s | BPM {result.bpm:.1f}"
+        f"Done: {result.source.name} -> {result.output.name if result.output else '-'} | "
+        f"{result.duration_seconds:.2f}s | BPM {result.bpm:.1f}"
         f" ({result.bpm_method}, confidence {result.bpm_confidence:.0%}) | "
-        f"tracks {result.note_tracks} | chips: {chips}"
+        f"note tracks {result.note_tracks} | chips: {chips}"
     )
+    if result.loop_start_seconds is not None and result.loop_end_seconds is not None:
+        text += f" | loop {result.loop_start_seconds:.3f}s-{result.loop_end_seconds:.3f}s"
     if result.unsupported_commands:
         text += f" | skipped unsupported commands: {result.unsupported_commands}"
     if result.warning:
@@ -1213,18 +1634,18 @@ def format_result(result: ConversionResult) -> str:
 
 
 
-def run_conversion(paths: Sequence[str], bpm: Optional[float] = None, output_dir: Optional[Path] = None) -> int:
+def run_conversion(paths: Sequence[str], bpm: Optional[float] = None, output_dir: Optional[Path] = None, pitch_bend_range: int = DEFAULT_PITCH_BEND_RANGE, midi_volume: int = DEFAULT_MIDI_VOLUME) -> int:
     """Convert paths supplied by Windows drag-and-drop or the command line."""
     files = gather_input_files(Path(p) for p in paths)
     if not files:
-        print("No .vgz or .vgm files were found to convert.", file=sys.stderr)
+        print("No .vgz or .vgm files were found.", file=sys.stderr)
         return 2
 
     failures: List[str] = []
     print(f"vgz2midi: starting conversion of {len(files)} file(s)")
     for path in files:
         try:
-            result = convert_file(path, output_dir, bpm)
+            result = convert_file(path, output_dir, bpm, pitch_bend_range, midi_volume)
             print(format_result(result))
         except Exception as exc:
             message = f"Failed: {path}: {exc}"
@@ -1240,15 +1661,14 @@ def run_conversion(paths: Sequence[str], bpm: Optional[float] = None, output_dir
         print(f"{len(failures)} error(s). Details: {log_path}", file=sys.stderr)
         return 1
 
-    print(f"Conversion finished: {len(files)} file(s)")
+    print(f"Conversion complete: {len(files)} file(s)")
     return 0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Drop VGZ/VGM files onto this Python script to create MIDI files in the same folder. "
-            "You can also provide multiple files or folders on the command line."
+            "Convert VGZ/VGM files to Standard MIDI Files. Multiple files or folders may be supplied."
         )
     )
     parser.add_argument("paths", nargs="*", help="input .vgz/.vgm files or folders")
@@ -1256,9 +1676,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--bpm",
         type=float,
         default=None,
-        help="set the MIDI BPM manually; when omitted, BPM is estimated from note timing",
+        help="override MIDI BPM; omit to estimate tempo from event timing",
     )
-    parser.add_argument("-o", "--output", help="output folder; when omitted, each MIDI file is written beside its source file")
+    parser.add_argument("-o", "--output", help="output folder; defaults to each source file folder")
+    parser.add_argument(
+        "--pitch-bend-range",
+        type=int,
+        default=DEFAULT_PITCH_BEND_RANGE,
+        choices=range(1, MAX_PITCH_BEND_RANGE + 1),
+        metavar="SEMITONES",
+        help=f"Pitch Bend sensitivity in semitones (default: {DEFAULT_PITCH_BEND_RANGE}; range: 1-{MAX_PITCH_BEND_RANGE})",
+    )
+    parser.add_argument(
+        "--midi-volume",
+        type=int,
+        default=DEFAULT_MIDI_VOLUME,
+        choices=range(0, 128),
+        metavar="0-127",
+        help=f"Maximum MIDI channel volume (default: {DEFAULT_MIDI_VOLUME}; range: 0-127)",
+    )
     return parser
 
 
@@ -1267,10 +1703,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if not args.paths:
         parser.print_help()
-        print("\nUsage: drop VGZ/VGM files or folders onto vgz2midi.py.")
+        print("\nUsage: drag VGZ/VGM files or folders onto vgz2midi.py, or pass them on the command line.")
         return 2
     output_dir = Path(args.output).expanduser().resolve() if args.output else None
-    return run_conversion(args.paths, args.bpm, output_dir)
+    return run_conversion(args.paths, args.bpm, output_dir, args.pitch_bend_range, args.midi_volume)
 
 
 if __name__ == "__main__":
