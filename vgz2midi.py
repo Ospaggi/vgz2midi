@@ -890,12 +890,12 @@ class VGMConverter:
         self.requested_bpm = bpm
         self.data = self._read_file(self.source)
         if len(self.data) < 0x40 or self.data[:4] != b"Vgm ":
-            raise ValueError("올바른 VGM/VGZ 파일이 아닙니다. VGM 헤더를 찾을 수 없습니다.")
+            raise ValueError("Invalid VGM/VGZ file: the VGM header was not found.")
         self.version = u32le(self.data, 0x08)
         data_rel = u32le(self.data, 0x34) if self.version >= 0x00000150 else 0
         self.data_offset = 0x34 + data_rel if data_rel else 0x40
         if self.data_offset < 0x40 or self.data_offset >= len(self.data):
-            raise ValueError(f"잘못된 VGM 데이터 오프셋입니다: 0x{self.data_offset:X}")
+            raise ValueError(f"Invalid VGM data offset: 0x{self.data_offset:X}")
         self.collector = MidiCollector(self.source.name, bpm if bpm is not None else DEFAULT_BPM)
         self.used_chips: Set[str] = set()
         self.unsupported_commands = 0
@@ -918,7 +918,7 @@ class VGMConverter:
             try:
                 return gzip.decompress(raw)
             except OSError as exc:
-                raise ValueError(f"VGZ 압축을 해제할 수 없습니다: {exc}") from exc
+                raise ValueError(f"Unable to decompress the VGZ file: {exc}") from exc
         return raw
 
     def _read_gd3_title(self) -> str:
@@ -990,7 +990,7 @@ class VGMConverter:
 
     def _require(self, size: int, pos: int) -> None:
         if pos + size > len(self.data):
-            raise ValueError(f"VGM 명령 스트림이 파일 끝에서 잘렸습니다: 0x{pos:X}")
+            raise ValueError(f"The VGM command stream is truncated at file offset 0x{pos:X}.")
 
     def _chip_write(self, cmd: int, reg: int, value: int, instance: int = 0) -> None:
         s = self.sample_pos
@@ -1068,7 +1068,7 @@ class VGMConverter:
             elif cmd == 0x67:
                 self._require(7, p)
                 if data[p + 1] != 0x66:
-                    raise ValueError(f"잘못된 VGM 데이터 블록입니다: 0x{p:X}")
+                    raise ValueError(f"Invalid VGM data block at file offset 0x{p:X}.")
                 size = u32le(data, p + 3)
                 self._require(7 + size, p)
                 p += 7 + size
@@ -1123,9 +1123,9 @@ class VGMConverter:
                 self.unsupported_commands += 1
                 p += 3
             else:
-                raise ValueError(f"지원되지 않거나 정의되지 않은 VGM 명령 0x{cmd:02X} (파일 위치 0x{p:X})")
+                raise ValueError(f"Unsupported or undefined VGM command 0x{cmd:02X} at file offset 0x{p:X}.")
             if p > len(data):
-                raise ValueError("VGM 명령 길이가 파일 크기를 초과했습니다.")
+                raise ValueError("A VGM command extends beyond the end of the file.")
 
         self.collector.stop_all(self.sample_pos)
 
@@ -1147,7 +1147,7 @@ class VGMConverter:
         note_tracks = sum(1 for track in self.collector.tracks.values() if track.events)
         warning = ""
         if not note_tracks:
-            warning = "지원되는 음표 이벤트를 찾지 못했습니다. PCM/미지원 칩 중심의 파일일 수 있습니다."
+            warning = "No supported note events were found. The file may primarily use PCM or an unsupported sound chip."
         return ConversionResult(
             source=self.source,
             output=output_path,
@@ -1170,7 +1170,7 @@ def output_path_for(source: Path, output_dir: Optional[Path]) -> Path:
 def convert_file(source: Path, output_dir: Optional[Path] = None, bpm: Optional[float] = None) -> ConversionResult:
     source = Path(source)
     if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
-        raise ValueError(f"지원하지 않는 확장자입니다: {source.suffix}")
+        raise ValueError(f"Unsupported file extension: {source.suffix}")
     converter = VGMConverter(source, bpm)
     return converter.convert(output_path_for(source, output_dir))
 
@@ -1198,17 +1198,17 @@ def gather_input_files(paths: Iterable[Path]) -> List[Path]:
 
 
 def format_result(result: ConversionResult) -> str:
-    chips = ", ".join(result.used_chips) if result.used_chips else "없음"
+    chips = ", ".join(result.used_chips) if result.used_chips else "none"
     text = (
-        f"완료: {result.source.name} -> {result.output.name if result.output else '-'} | "
-        f"{result.duration_seconds:.2f}초 | BPM {result.bpm:.1f}"
-        f" ({result.bpm_method}, 신뢰도 {result.bpm_confidence:.0%}) | "
-        f"트랙 {result.note_tracks} | 칩: {chips}"
+        f"Converted: {result.source.name} -> {result.output.name if result.output else '-'} | "
+        f"{result.duration_seconds:.2f} s | BPM {result.bpm:.1f}"
+        f" ({result.bpm_method}, confidence {result.bpm_confidence:.0%}) | "
+        f"tracks {result.note_tracks} | chips: {chips}"
     )
     if result.unsupported_commands:
-        text += f" | 건너뛴 미지원 명령 {result.unsupported_commands}개"
+        text += f" | skipped unsupported commands: {result.unsupported_commands}"
     if result.warning:
-        text += f" | 경고: {result.warning}"
+        text += f" | warning: {result.warning}"
     return text
 
 
@@ -1217,17 +1217,17 @@ def run_conversion(paths: Sequence[str], bpm: Optional[float] = None, output_dir
     """Convert paths supplied by Windows drag-and-drop or the command line."""
     files = gather_input_files(Path(p) for p in paths)
     if not files:
-        print("변환할 .vgz 또는 .vgm 파일을 찾지 못했습니다.", file=sys.stderr)
+        print("No .vgz or .vgm files were found to convert.", file=sys.stderr)
         return 2
 
     failures: List[str] = []
-    print(f"vgz2midi: {len(files)}개 파일 변환 시작")
+    print(f"vgz2midi: starting conversion of {len(files)} file(s)")
     for path in files:
         try:
             result = convert_file(path, output_dir, bpm)
             print(format_result(result))
         except Exception as exc:
-            message = f"실패: {path}: {exc}"
+            message = f"Failed: {path}: {exc}"
             failures.append(message)
             print(message, file=sys.stderr)
 
@@ -1237,28 +1237,28 @@ def run_conversion(paths: Sequence[str], bpm: Optional[float] = None, output_dir
         base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
         log_path = base_dir / "vgz2midi_errors.txt"
         log_path.write_text("\n".join(failures) + "\n", encoding="utf-8")
-        print(f"오류 {len(failures)}개. 자세한 내용: {log_path}", file=sys.stderr)
+        print(f"{len(failures)} error(s). Details: {log_path}", file=sys.stderr)
         return 1
 
-    print(f"변환 완료: {len(files)}개")
+    print(f"Conversion finished: {len(files)} file(s)")
     return 0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "VGZ/VGM 파일을 이 Python 파일 위에 끌어다 놓으면 같은 폴더에 MIDI를 생성합니다. "
-            "명령행에서는 파일이나 폴더를 여러 개 지정할 수 있습니다."
+            "Drop VGZ/VGM files onto this Python script to create MIDI files in the same folder. "
+            "You can also provide multiple files or folders on the command line."
         )
     )
-    parser.add_argument("paths", nargs="*", help="입력 .vgz/.vgm 파일 또는 폴더")
+    parser.add_argument("paths", nargs="*", help="input .vgz/.vgm files or folders")
     parser.add_argument(
         "--bpm",
         type=float,
         default=None,
-        help="MIDI BPM 수동 지정; 생략하면 음표 타이밍에서 자동 감지",
+        help="set the MIDI BPM manually; when omitted, BPM is estimated from note timing",
     )
-    parser.add_argument("-o", "--output", help="출력 폴더; 생략하면 각 원본 파일의 폴더")
+    parser.add_argument("-o", "--output", help="output folder; when omitted, each MIDI file is written beside its source file")
     return parser
 
 
@@ -1267,7 +1267,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if not args.paths:
         parser.print_help()
-        print("\n사용법: VGZ/VGM 파일이나 폴더를 vgz2midi.py 위에 끌어다 놓으세요.")
+        print("\nUsage: drop VGZ/VGM files or folders onto vgz2midi.py.")
         return 2
     output_dir = Path(args.output).expanduser().resolve() if args.output else None
     return run_conversion(args.paths, args.bpm, output_dir)
